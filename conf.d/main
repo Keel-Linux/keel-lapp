@@ -1,8 +1,207 @@
-#!/bin/sh -ex
+#!/bin/bash -ex
+# LAPP, on top of the apache-php layer, with PostgreSQL carried as a fab unit.
+#
+# This file is keel-lamp's conf.d/main with the database named differently,
+# and with two blocks that are genuinely not the same because the two
+# components are not the same. Both are marked below and both are in
+# README.rst, because they are the measurement this work exists to report.
+#
+# This file is the same in both artefacts of this recipe. Nothing in it asks
+# which one is being built; it measures what is in the image and acts on that.
+# HAS_SERVER below is read from dpkg and not from the makefile variable that
+# decided whether the unit was applied, because the makefile variable says
+# what was asked for and dpkg says what happened. traps.md: asserting the
+# configuration is not asserting the behaviour.
+#
+# What has already run, in this order:
+#   the parent layer, apache-php, so Apache, PHP, Adminer, Composer, the CGI
+#   path, Adminer's vhost on 12322 and the web control panel are in place and
+#   bt-layer did not re-apply any of them;
+#   the shared tree's conf/adminer-pgsql, in the artefact with a server only,
+#   which points Adminer at the PostgreSQL driver;
+#   unit.d/postgresql's overlay and conf script, in the artefact with a server
+#   only, which recreate the cluster as UTF-8, turn on password encryption,
+#   reduce shared_buffers, set the listen addresses, give root a superuser
+#   role, and set the postgres role's build time password;
+#   this recipe's own overlay, which is where the appliance's landing page
+#   comes from.
 
-# enable cgi
-a2enmod cgi
+PGSQL_PORT=5432
+# The two loopback addresses, written as literals. On Debian, localhost is not
+# an IPv6 name: /etc/hosts maps ::1 to ip6-localhost and never to localhost,
+# so a server told to listen on "localhost" listens on IPv4 alone and an
+# appliance that reaches its database over IPv6, which is what this project
+# builds for, finds nothing listening. traps.md has the measurement, and it
+# was this engine that it was measured on.
+PGSQL_LISTEN="::1,127.0.0.1"
+# The superuser role the component creates. firstboot.d/35pgsqlpass, which the
+# component also ships, gives it the declared password at first boot.
+PGSQL_ROLE=postgres
+# The token the overlay's landing page carries, replaced below with a sentence
+# that is true of the artefact being built.
+PAGE=/var/www/index.php
+PAGE_TOKEN=@KEEL_DB_LOCATION@
 
-# remove unrequired webcp icons (all except those named) 
-cd /var/www/images
-find . -type f ! -name "adminer.png" ! -name "shell.png" ! -name "tab.png" ! -name "webmin.png" -delete
+# What is actually in this image. postgresql is the metapackage the unit's
+# plan asks for.
+if dpkg-query -W -f '${Status}' postgresql 2>/dev/null \
+        | grep -qx 'install ok installed'; then
+    HAS_SERVER=yes
+else
+    HAS_SERVER=no
+fi
+if [[ "$HAS_SERVER" = yes ]]; then
+    echo "conf.d/main: this image carries a local PostgreSQL server"
+else
+    echo "conf.d/main: this image carries no local PostgreSQL server"
+fi
+
+if [[ "$HAS_SERVER" = yes ]]; then
+    PGSQL_VER=$(ls /etc/postgresql/)
+    CONF_DIR=/etc/postgresql/$PGSQL_VER/main
+
+    # FIRST DIFFERENCE FROM keel-lamp, and it is the component's doing.
+    # unit-postgresql writes the listen addresses itself, with the reasoning
+    # in a comment, because the addresses a server answers on belong to
+    # whoever installs the server. unit-mariadb does not, so keel-lamp has to
+    # write the equivalent file and this recipe only has to check the line is
+    # there. The check is kept rather than dropped: a component that stopped
+    # writing it would otherwise ship a stack answering on one family.
+    grep -qE "^listen_addresses = '::1,127\.0\.0\.1'" "$CONF_DIR/postgresql.conf"
+    # Upstream's postgresql appliance replaces listen_addresses with '*' and
+    # appends a pg_hba line accepting password authentication from 0.0.0.0/0.
+    # This stack must not inherit either by accident.
+    ! grep -qE "^listen_addresses = '\*'" "$CONF_DIR/postgresql.conf"
+    ! grep -qE '^host\s+all\s+all\s+0\.0\.0\.0/0' "$CONF_DIR/pg_hba.conf"
+    # A TCP connection on the IPv6 loopback is authenticated by password,
+    # which is what the boot test proves on the booted machine.
+    grep -qE '^host\s+all\s+all\s+::1/128\s+scram-sha-256' "$CONF_DIR/pg_hba.conf"
+
+    systemctl start postgresql
+
+    # SECOND DIFFERENCE FROM keel-lamp, and it is also the component's doing.
+    # unit-postgresql's conf script opens with "set ${PGSQL_PASS:=postgres}",
+    # so a build that names no PGSQL_PASS gives the superuser the password
+    # 'postgres'. A layer is fetched by name and reused, so every appliance
+    # built on it would ship the same known superuser password. keel-lamp has
+    # no equivalent step because the shared tree's conf/adminer-mysql creates
+    # its account with a value from mcookie that nobody records.
+    #
+    # Removing the password rather than choosing another one is deliberate. A
+    # build time value would be the same on every appliance built from this
+    # layer, and a random one would make the layer irreproducible (brief
+    # section 5.4). With no password the role authenticates nothing over TCP
+    # until firstboot.d/35pgsqlpass sets it from DB_PASS, so the failure mode
+    # is a database nobody can reach rather than one everybody can.
+    su postgres -c "psql --quiet postgres" <<EOF
+ALTER ROLE $PGSQL_ROLE PASSWORD NULL;
+EOF
+    su postgres -c "psql --quiet --tuples-only --no-align postgres" <<EOF | grep -qx t
+SELECT rolpassword IS NULL FROM pg_authid WHERE rolname = '$PGSQL_ROLE';
+EOF
+
+    # The cluster answers on both loopback families, asked rather than read
+    # off the file that was just checked.
+    for address in ${PGSQL_LISTEN//,/ }; do
+        pg_isready --host="$address" --port="$PGSQL_PORT"
+    done
+
+    # The hook that will give the role its declared password at first boot
+    # ships with the component and has to be executable, or a declared
+    # password never reaches the database.
+    test -x /usr/lib/inithooks/firstboot.d/35pgsqlpass
+
+    systemctl stop postgresql
+else
+    # No server in this image, and nothing may quietly install one: an idle
+    # database server in the artefact an operator chose because their database
+    # is elsewhere is the failure this split exists to prevent. The boot test
+    # asks the running machine the same question.
+    ! dpkg-query -W -f '${Status}' postgresql 2>/dev/null \
+        | grep -qx 'install ok installed'
+    test ! -d /etc/postgresql
+    ! compgen -G '/var/lib/postgresql/*/main' >/dev/null
+
+    # Adminer still has to know which driver it speaks, which is what the
+    # shared tree's conf/adminer-pgsql does. It needs no server, so it could
+    # have run here too; doing it in this branch is what keeps this file and
+    # keel-lamp's the same shape, because the MySQL script cannot.
+    sed -i '/^.*\$tkl_server/ s|DB_DESC|PostgreSQL|' /etc/adminer/tkl-index.php
+    sed -i '/^.*\$tkl_database/ s|DRIVER|pgsql|' /etc/adminer/tkl-index.php
+fi
+
+# Adminer speaks to PostgreSQL in both artefacts, which is the assertion that
+# the branch above did its job either way. A page still holding the
+# placeholders would offer the operator a driver chooser instead of their
+# database.
+grep -q '"PostgreSQL on "' /etc/adminer/tkl-index.php
+grep -q '\$tkl_database = "pgsql"' /etc/adminer/tkl-index.php
+# Only the two code lines, because the file's own comment names both
+# placeholders to say what the conf script substitutes.
+! grep -qE '^[^/]*\$tkl_(servers|database).*(DB_DESC|DRIVER)' /etc/adminer/tkl-index.php
+
+# The appliance's own landing page. Every LAPP has had one, it belongs to the
+# appliance and not to the operator's site, and it carries the mark until they
+# replace it (docs/brand/README.md, "What not to do"). The one sentence on it
+# that is not the same in both artefacts is written here, from what the image
+# turned out to contain.
+if [[ "$HAS_SERVER" = yes ]]; then
+    location="a PostgreSQL server on this machine, reached over the loopback on ::1 and 127.0.0.1"
+else
+    location="a PostgreSQL server you configure elsewhere: this appliance ships the client and the drivers, and no local server"
+fi
+sed -i "s|$PAGE_TOKEN|$location|" "$PAGE"
+! grep -q "$PAGE_TOKEN" "$PAGE"
+# The page is the appliance's, so the mark is on it and must resolve.
+test -s /var/www/keel-lockup.svg
+grep -q 'keel-lockup.svg' "$PAGE"
+
+# PHP can speak to the database. The driver is a package in the plan, and a
+# plan is a request; this is the loaded extension, which is what a page uses.
+php -r 'exit(extension_loaded("pgsql") && extension_loaded("pdo_pgsql") ? 0 : 1);'
+
+# The command line client is here in both artefacts, because reaching a
+# database somewhere else needs it just as much as reaching a local one.
+command -v psql >/dev/null
+
+# fab-plan-resolve keeps a package the parent layer already carries at the
+# parent's version, so the two core packages are upgraded here from the build
+# time source (keel, new in the plan, was installed from it already).
+#
+# The overlay of this layer ships /etc/confconsole/services.txt, which is a
+# conffile of confconsole, so dpkg sees it as locally modified and asks what
+# to do with it. The conf script runs with stdin closed, dpkg reads end of
+# file at the prompt and leaves confconsole "install ok unpacked", which fails
+# this script. Keep the overlay's file without asking. Same block as
+# keel-lamp, keel-postgresql and keel-mariadb, which is where the pattern is
+# maintained.
+export DEBIAN_FRONTEND=noninteractive
+apt-get install -y --only-upgrade \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    inithooks confconsole
+
+# A half configured package keeps its new version, so check the state too.
+[[ $(dpkg-query -W -f '${Status}\n' inithooks confconsole keel \
+    | grep -c '^install ok installed$') -eq 3 ]]
+
+# A floor, not a literal: the declarative first boot this stack depends on
+# landed in these versions, and a build that read a stale index would ship a
+# layer whose declared database password never reaches the database.
+while read -r package floor; do
+    installed=$(dpkg-query -W -f '${Version}' "$package")
+    dpkg --compare-versions "$installed" ge "$floor" \
+        || { echo "$package $installed is older than $floor" >&2; exit 1; }
+done <<EOF
+inithooks 2.3.6+keel4
+confconsole 2.2.3+keel2
+keel 0.2.1
+EOF
+dpkg-query -W -f '${Package} ${Version} ${Status}\n' inithooks confconsole keel
+
+# The build time package source is not for appliances: remove it, keep the
+# documented, disabled entry for the future signed repository (overlay).
+rm -f /etc/apt/sources.list.d/keel-staging.list
+rm -rf /srv/keel-apt
+rm -rf /var/lib/apt/lists/*
+grep -q '^Enabled: no' /etc/apt/sources.list.d/keel.sources

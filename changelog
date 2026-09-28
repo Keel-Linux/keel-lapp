@@ -1,3 +1,72 @@
+turnkey-lapp-19.0 (2) turnkey; urgency=low
+
+  * LAPP is rebuilt as a child of the apache-php layer with PostgreSQL
+    carried as a fab unit, instead of a single recipe on core that installs
+    the web half itself. Decision 0013 is the reason: a database is a
+    component, so LAMP and LAPP share one web layer rather than each being
+    the child of its own database. The web half is no longer built twice.
+
+        git clone --branch v1.0.0 \
+            https://github.com/keel-linux/unit-postgresql.git unit.d/postgresql
+        bt-layer lapp --parent apache-php
+
+  * Two artefacts come out of this one recipe, split by content and not by
+    topology, and the names say what is in them:
+
+        lapp          Apache, PHP and a local PostgreSQL server
+        lapp-client   the same stack with the client and the drivers and no
+                      local server, for the database that lives elsewhere
+
+    They differ by exactly one thing in the product directory: whether
+    unit.d/postgresql is there. Nothing in the recipe asks which artefact is
+    being built by name; conf.d/main reads what dpkg says the image
+    contains, so an artefact that shipped a server it was not meant to have
+    would fail its own build.
+
+  * This recipe is keel-lamp's with the database named differently. The
+    Makefile and the plan are the same file once the four database packages
+    are named by their role, and conf.d/main is the same script with two
+    blocks that differ, both because the two components are not the same:
+
+      - the listen addresses. unit-postgresql writes them itself, so this
+        recipe only checks the line is there; unit-mariadb does not, so
+        keel-lamp has to write the equivalent file.
+      - the build time credential. unit-postgresql's conf script gives the
+        superuser the password 'postgres' when the build names none, so
+        this recipe sets it to NULL afterwards; keel-lamp has no equivalent
+        step, because the shared tree's conf/adminer-mysql creates its
+        account with a value from mcookie that nobody records.
+
+    Both are asymmetries in the components, not in the composition, and
+    both are in README.rst with what would remove them.
+
+  * The appliance's own landing page, /var/www/index.php, carries the mark
+    from docs/brand of the handbook. It is the appliance's page and not the
+    operator's site, which is the one place the brand manual asks for the
+    mark to stay until it is replaced, and the page says which file to
+    replace. The host name it prints comes from the request and is escaped
+    before it reaches the document, which the upstream page did not do.
+
+  * The database password is the component's path: firstboot.d/35pgsqlpass,
+    which unit-postgresql ships, reads DB_PASS from the declarative first
+    boot and gives it to the postgres role. The layer is published with that
+    role unable to authenticate.
+
+  * The cluster answers on ::1 and on 127.0.0.1, as literal addresses, which
+    the component sets and this recipe checks. Debian's default,
+    listen_addresses = 'localhost', binds the IPv4 loopback only, because
+    /etc/hosts maps ::1 to ip6-localhost and never to localhost.
+
+  * Four packages the two upstream recipes ship are deliberately not here,
+    each in plan/main with its reason: python3-pygresql (this stack's
+    second Python driver, superseded by psycopg2), and LAMP's
+    libapache2-mod-python, php-xdebug and php-pear. Upstream LAPP's
+    removelist is gone too: it removed /var/www/index.html, which no layer
+    in this chain creates. Keeping any of them would make one of the two
+    recipes differ from the other in something that is not the database.
+
+ -- Marcos Méndez <mendez.foto@gmail.com>  Sun, 27 Sep 2026 23:00:00 +0000
+
 turnkey-lapp-19.0 (1) turnkey; urgency=low
 
   * Upgraded base distribution to Debian 13.x/Trixie.
